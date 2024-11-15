@@ -3,13 +3,13 @@ CFLAGS=
 
 SOURCES = $(wildcard src/*.c)
 
-out/shepherd: a.out out
-	cp a.out out/shepherd && \
+out/shepherd: out/a.out out
+	cp out/a.out out/shepherd && \
 	chmod 777 out/shepherd && \
-	rm -f a.out
+	rm -f out/a.out
 
-a.out: src/main.c $(CC)
-	$(CC) $(CFLAGS) src/main.c
+out/a.out: src/main.c $(CC) out
+	$(CC) $(CFLAGS) -o out/a.out src/main.c
 
 out:
 	mkdir out
@@ -24,7 +24,7 @@ update:
 	cd ..
 
 shecc:
-	git submodule add https://github.com/sysprog21/shecc.git shecc
+	git submodule update --init --recursive
 
 run: out/shepherd
 	./out/shepherd
