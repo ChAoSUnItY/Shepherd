@@ -85,9 +85,8 @@ typedef enum {
     T_cppd_endif,
     T_cppd_ifdef,
     T_cppd_ifndef,
-    /* Hint tokens for specific circumstances */
-    T_newline,
-    T_backslash
+    /* Hint tokens */
+    T_newline
 } token_type_t;
 
 typedef struct {
@@ -102,15 +101,36 @@ struct token_t {
     int dummy;
     location_t loc;
     token_type_t typ;
+    /* TODO: Considering using span to minimize memory usage */
     char literal[MAX_TOKEN_LEN];
     token_t *next;
+};
+
+typedef struct macro_param_t macro_param_t;
+
+struct macro_param_t {
+    token_t *param_token;
+    bool is_variadic;
+    macro_param_t *next;
 };
 
 typedef struct {
     token_t *name;
     token_t *replacement;
-    bool functiono_like;
+    macro_param_t *params;
+    bool function_like;
+    bool is_variadic;
     bool disabled;
 } macro_t;
+
+typedef struct macro_arg_t macro_arg_t;
+
+struct macro_arg_t {
+    token_t *name;
+    bool is_variadic;
+    token_t *replacement;
+    token_t *expanded;
+    macro_arg_t *next;
+};
 
 #endif

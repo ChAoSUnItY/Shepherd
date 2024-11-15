@@ -1,3 +1,6 @@
+#ifndef GLOBALS_C
+#define GLOBALS_C
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +12,15 @@ char *FILE_SOURCES[MAX_FILE];
 
 int macros_idx = 0;
 macro_t *MACROS;
+
+void cptok(token_t *dst, token_t *src)
+{
+    if (!dst && !src)
+        return;
+    dst->typ = src->typ;
+    memcpy(&dst->loc, &src->loc, sizeof(location_t));
+    strcpy(dst->literal, src->literal);
+}
 
 int file_map_add_entry(char *file_path, char **source_ref, int *len_ref)
 {
@@ -42,7 +54,7 @@ int file_map_add_entry(char *file_path, char **source_ref, int *len_ref)
 
 macro_t *add_macro(bool function_like) {
     macro_t *macro = &MACROS[macros_idx++];
-    macro->functiono_like = function_like;
+    macro->function_like = function_like;
     macro->disabled = false;
     return macro;
 }
@@ -61,12 +73,19 @@ macro_t *find_macro(char *name) {
     return NULL;
 }
 
+void free_macros() {
+    for (int i = 0; i < macros_idx; i++)
+        if (MACROS[i].params)
+            free(MACROS[i].params);
+    free(MACROS);
+}
+
 void init_globals() {
     MACROS = malloc(MAX_MACROS * sizeof(macro_t));
 }
 
 void free_globals() {
-    free(MACROS);
+    free_macros();
 
     for (int i = 0; i < file_map_idx; i++) {
         free(FILE_NAMES[i]);
@@ -149,16 +168,19 @@ void error(char *str, location_t *location, ...)
            location->line, location->col, ERR_MSG_BUF);
 
     char line[MAX_LINE_LEN], *source = FILE_SOURCES[location->file_idx];
-    int start_pos = 0, len = 0;
+    int line_num = 1, line_start = 0, pos = 0, len;
 
-    for (int line_num = 1; line_num < location->line; line_num++) {
-        while (source[start_pos] != '\n')
-            start_pos++;
-        start_pos++;
+    while (source[pos] && line_num < location->line) {
+        if (source[pos] == '\n') {
+            line_num++;
+            line_start = pos + 1;
+        }
+        pos++;
     }
-    while (source[start_pos + len] != '\n')
-        len++;
-    strncpy(line, source + start_pos, len);
+    while (source[pos] && source[pos] != '\n')
+        pos++;
+    len = pos - line_start;
+    strncpy(line, source + line_start, len);
     line[len] = '\0';
     printf("%s\n", line);
     for (len = 0; len < location->col - 1; len++)
@@ -169,3 +191,5 @@ void error(char *str, location_t *location, ...)
 
     exit(1);
 }
+
+#endif

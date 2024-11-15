@@ -36,6 +36,37 @@ token_t *alloc_token(token_arena_t *arena, int size)
     return data;
 }
 
+/* Copies single token data to a new token */
+token_t *arena_copy_token(token_arena_t *arena, token_t *token)
+{
+    if (!token)
+        return NULL;
+
+    token_t *new_token = alloc_token(arena, 1);
+    cptok(new_token, token);
+    return new_token;
+}
+
+/* Copies whole token list to a new token list */
+token_t *arena_copy_tokens(token_arena_t *arena, token_t *token_list)
+{
+    if (!token_list)
+        return NULL;
+
+    token_t *new_token_head = alloc_token(arena, 1), *cur = new_token_head;
+    cptok(new_token_head, token_list);
+
+    token_list = token_list->next;
+    while (token_list) {
+        cur->next = alloc_token(arena, 1);
+        cur = cur->next;
+        cptok(cur, token_list);
+        token_list = token_list->next;
+    }
+
+    return new_token_head;
+}
+
 void arena_free(token_arena_t *arena)
 {
     if (!arena)
@@ -51,8 +82,9 @@ typedef struct {
     token_arena_t *arena;
     int file_idx;
     lexer_mode_t mode;
+    macro_arg_t *macro_args;
     /* LM_Source specific members */
-    char source[MAX_SOURCE];
+    char *source;
     int source_len;
     int pos;
     int line;
@@ -75,7 +107,8 @@ regional_lexer_t *reg_lexer_source_init(token_arena_t *arena,
     lexer->arena = arena;
     lexer->file_idx = file_idx;
     lexer->mode = LM_source;
-    strcpy(lexer->source, source);
+    lexer->macro_args = NULL;
+    lexer->source = source;
     lexer->source_len = source_len;
     lexer->pos = 0;
     lexer->line = 1;
@@ -83,17 +116,20 @@ regional_lexer_t *reg_lexer_source_init(token_arena_t *arena,
     lexer->cur_token = NULL;
     lexer->after_newline = true;
     lexer->inside_macro = false;
+    lexer->tokens_head = NULL;
     return lexer;
 }
 
 regional_lexer_t *reg_lexer_token_init(token_arena_t *arena,
                                        token_t *tokens_head,
+                                       macro_arg_t *macro_args,
                                        int file_idx)
 {
     regional_lexer_t *lexer = malloc(sizeof(regional_lexer_t));
     lexer->arena = arena;
     lexer->file_idx = file_idx;
     lexer->mode = LM_token;
+    lexer->macro_args = macro_args;
     lexer->tokens_head = tokens_head;
     return lexer;
 }
@@ -164,7 +200,11 @@ char reg_lexer_peek_char(regional_lexer_t *lexer, int offset)
     if (lexer->pos + offset >= lexer->source_len)
         return '\0';
 
-    return lexer->source[lexer->pos + offset];
+    /* FIXME: Currently requires a temporary variable to store string ptr in
+     * order to prevent flaw machine code generation. */
+    char *src = lexer->source;
+
+    return src[lexer->pos + offset];
 }
 
 void reg_lexer_read_char(regional_lexer_t *lexer, int len)
@@ -177,13 +217,42 @@ void reg_lexer_skip_white_space(regional_lexer_t *lexer)
 {
     /* Only true if it's at the start of file or behind a newline character,
      * false otherwise. */
+    bool after_backslash = false;
     bool after_new_line =
         lexer->pos == 0 ||
         (lexer->cur_token && lexer->cur_token->typ == T_newline);
+    if (lexer->cur_token && lexer->cur_token->typ == T_newline) {
+        /* pos already incremented by the current token (T_newline) */
+        lexer->line += 1;
+        lexer->col = 1;
+    }
     char ch;
 
     while (true) {
         ch = reg_lexer_peek_char(lexer, 0);
+
+        if (lexer->inside_macro && is_newline(ch)) {
+            if (!after_backslash) {
+                /* End of macro, stops skipping and macro parser
+                 * should handle the upcoming newline token
+                 */
+                break;
+            } else {
+                /* Continues macro parsing. */
+                after_backslash = false;
+                lexer->line += 1;
+                lexer->col = 1;
+                lexer->pos += 1;
+                continue;
+            }
+        }
+
+        if (lexer->inside_macro && ch == '\\') {
+            lexer->pos += 1;
+            lexer->col += 1;
+            after_backslash = true;
+            continue;
+        }
 
         if (!lexer->inside_macro && is_newline(ch)) {
             lexer->line += 1;
@@ -193,7 +262,7 @@ void reg_lexer_skip_white_space(regional_lexer_t *lexer)
             continue;
         }
 
-        if (is_white_space(ch) || (!lexer->inside_macro && ch == '\\')) {
+        if (is_white_space(ch)) {
             lexer->pos += 1;
             lexer->col += 1;
             continue;
@@ -201,6 +270,10 @@ void reg_lexer_skip_white_space(regional_lexer_t *lexer)
 
         break;
     }
+
+    if (lexer->inside_macro && after_backslash)
+        error("Expected newline after backslash",
+              reg_lexer_cur_loc(lexer, NULL));
 
     lexer->after_newline = after_new_line;
 }
@@ -593,11 +666,6 @@ void reg_lexer_next_token(regional_lexer_t *lexer)
         return;
     }
 
-    if (ch == '\\') {
-        reg_lexer_make_token(lexer, T_backslash, 1);
-        return;
-    }
-
     if (is_newline(ch)) {
         reg_lexer_make_token(lexer, T_newline, 1);
         return;
@@ -693,8 +761,8 @@ void reg_lexer_expect_token(regional_lexer_t *lexer, token_type_t typ)
         return;
     }
 
-    error("Unexpected token `%s`", &lexer->cur_token->loc,
-          lexer->cur_token->literal);
+    error("Unexpected token `%s`, expected `tk_typ: %d`",
+          &lexer->cur_token->loc, lexer->cur_token->literal, typ);
 }
 
 void reg_lexer_make_token(regional_lexer_t *lexer, token_type_t typ, int len)
@@ -877,21 +945,14 @@ void lexer_expect_token(lexer_t *lexer, token_type_t typ)
     return false;
 }
 
-token_t *lexer_read_alias_macro(lexer_t *lexer, regional_lexer_t *reg_lexer)
+token_t *lexer_read_macro_replacement(lexer_t *lexer,
+                                      regional_lexer_t *reg_lexer)
 {
     token_t *token = reg_lexer->cur_token, *cur = token;
-    reg_lexer->inside_macro = true;
 
     while (!reg_lexer_accept_token(reg_lexer, T_eof)) {
         if (reg_lexer_peek_token(reg_lexer, T_newline, NULL))
             break;
-
-        if (reg_lexer_accept_token(reg_lexer, T_backslash)) {
-            if (!reg_lexer_accept_token(reg_lexer, T_newline))
-                error("Expected newline after backslash",
-                      &reg_lexer->cur_token->loc);
-            continue;
-        }
 
         cur->next = reg_lexer->cur_token;
         cur = cur->next;
@@ -905,6 +966,44 @@ token_t *lexer_read_alias_macro(lexer_t *lexer, regional_lexer_t *reg_lexer)
     return token;
 }
 
+void read_macro_params(lexer_t *lexer,
+                       regional_lexer_t *reg_lexer,
+                       macro_t *macro)
+{
+    macro_param_t *params_head = malloc(sizeof(macro_param_t)),
+                  *cur = params_head;
+    bool is_variadic = false;
+
+    if (!reg_lexer_accept_token(reg_lexer, T_close_bracket)) {
+        for (;;) {
+            if (reg_lexer_peek_token(reg_lexer, T_elipsis, NULL)) {
+                is_variadic = true;
+                cur->param_token = reg_lexer->cur_token;
+                cur->is_variadic = true;
+                reg_lexer_expect_token(reg_lexer, T_elipsis);
+                reg_lexer_expect_token(reg_lexer, T_close_bracket);
+                break;
+            }
+
+            cur->param_token = reg_lexer->cur_token;
+            cur->is_variadic = false;
+            reg_lexer_expect_token(reg_lexer, T_identifier);
+
+            if (!reg_lexer_accept_token(reg_lexer, T_comma)) {
+                reg_lexer_expect_token(reg_lexer, T_close_bracket);
+                break;
+            } else {
+                cur->next = malloc(sizeof(macro_param_t));
+                cur = cur->next;
+            }
+        }
+    }
+
+    cur->next = NULL;
+    macro->params = params_head;
+    macro->is_variadic = is_variadic;
+}
+
 /* Reads preprocessor directive, this action is location-sensitive. */
 void lexer_read_directive(lexer_t *lexer, regional_lexer_t *reg_lexer)
 {
@@ -913,6 +1012,7 @@ void lexer_read_directive(lexer_t *lexer, regional_lexer_t *reg_lexer)
               &reg_lexer->cur_token->loc);
 
     reg_lexer_expect_token(reg_lexer, T_cppd_hash);
+    reg_lexer->inside_macro = true;
 
     if (!strcmp(reg_lexer->cur_token->literal, "define")) {
         macro_t *macro;
@@ -921,29 +1021,209 @@ void lexer_read_directive(lexer_t *lexer, regional_lexer_t *reg_lexer)
         macro->name = reg_lexer->cur_token;
         reg_lexer_expect_token(reg_lexer, T_identifier);
 
-        /* TODO: Implement function-like parser here */
-        token_t *replacement = lexer_read_alias_macro(lexer, reg_lexer);
-        macro->replacement = replacement;
+        if (reg_lexer_accept_token(reg_lexer, T_open_bracket)) {
+            read_macro_params(lexer, reg_lexer, macro);
+            token_t *replacement =
+                lexer_read_macro_replacement(lexer, reg_lexer);
+            macro->replacement = replacement;
+            macro->function_like = true;
+        } else {
+            token_t *replacement =
+                lexer_read_macro_replacement(lexer, reg_lexer);
+            macro->replacement = replacement;
+            macro->function_like = false;
+        }
+
         return;
     }
-
 
     error("Unexpected preprocessor directive `%s`", &reg_lexer->cur_token->loc,
           reg_lexer->cur_token->literal);
 }
 
-bool lexer_expand_macro(lexer_t *lexer, regional_lexer_t *reg_lexer)
+macro_arg_t *lexer_read_macro_arg(lexer_t *lexer,
+                                  regional_lexer_t *reg_lexer,
+                                  token_t *name_token_ref,
+                                  bool is_variadic)
+{
+    macro_arg_t *arg = malloc(sizeof(macro_arg_t));
+    int bracket_level = 0;
+    token_t *replacement = reg_lexer->cur_token, *cur = replacement;
+
+    for (;;) {
+        if (bracket_level == 0 &&
+            reg_lexer_peek_token(reg_lexer, T_close_bracket, NULL))
+            break;
+        if (bracket_level == 0 && !is_variadic &&
+            reg_lexer_peek_token(reg_lexer, T_comma, NULL))
+            break;
+
+        if (reg_lexer_accept_token(reg_lexer, T_eof))
+            error("Unterminated macro argument list",
+                  reg_lexer_cur_loc(reg_lexer, NULL));
+
+        if (reg_lexer_accept_token(reg_lexer, T_open_bracket))
+            bracket_level++;
+        else if (reg_lexer_accept_token(reg_lexer, T_close_bracket))
+            bracket_level--;
+
+        cur->next = reg_lexer->cur_token;
+        cur = cur->next;
+        reg_lexer_next_token(reg_lexer);
+    }
+
+    cur->next = NULL;
+    arg->replacement = replacement;
+    arg->name = name_token_ref;
+    arg->is_variadic = is_variadic;
+    return arg;
+}
+
+macro_arg_t *lexer_read_macro_args(lexer_t *lexer,
+                                   regional_lexer_t *reg_lexer,
+                                   macro_t *macro)
+{
+    macro_arg_t *macro_arg_head = NULL, *cur = NULL, *arg;
+
+    for (macro_param_t *macro_param = macro->params; macro_param;
+         macro_param = macro_param->next) {
+        if (macro_arg_head)
+            reg_lexer_expect_token(reg_lexer, T_comma);
+        if (!macro_arg_head) {
+            macro_arg_head =
+                lexer_read_macro_arg(lexer, reg_lexer, macro_param->param_token,
+                                     macro_param->is_variadic);
+            cur = macro_arg_head;
+        } else {
+            arg =
+                lexer_read_macro_arg(lexer, reg_lexer, macro_param->param_token,
+                                     macro_param->is_variadic);
+            cur->next = arg;
+            cur = arg;
+        }
+    }
+
+    reg_lexer_expect_token(reg_lexer, T_close_bracket);
+    return macro_arg_head;
+}
+
+bool lexer_expand_macro_direct(lexer_t *lexer, regional_lexer_t *reg_lexer)
 {
     macro_t *macro = find_macro(reg_lexer->cur_token->literal);
 
     if (macro) {
-        if (macro->functiono_like) {
-        } else {
+        if (macro->function_like) {
+            reg_lexer_expect_token(reg_lexer, T_identifier);
+            reg_lexer_expect_token(reg_lexer, T_open_bracket);
+            macro_arg_t *args = lexer_read_macro_args(lexer, reg_lexer, macro);
             regional_lexer_t *macro_lexer = reg_lexer_token_init(
-                lexer->arena, macro->replacement, reg_lexer->file_idx);
+                lexer->arena, macro->replacement, args, reg_lexer->file_idx);
+            lexer_stack_push(lexer->regional_lexers, macro_lexer);
+            return true;
+        } else {
+            reg_lexer_expect_token(reg_lexer, T_identifier);
+            regional_lexer_t *macro_lexer = reg_lexer_token_init(
+                lexer->arena, macro->replacement, NULL, reg_lexer->file_idx);
             lexer_stack_push(lexer->regional_lexers, macro_lexer);
             return true;
         }
+    }
+
+    return false;
+}
+
+token_t *lexer_expand_macro_indirect(lexer_t *lexer,
+                                     regional_lexer_t *reg_lexer,
+                                     token_t *tok)
+{
+    macro_t *macro = find_macro(tok->literal);
+
+    if (macro) {
+        if (macro->function_like) {
+            /* TODO: Implement here */
+        } else {
+            token_t *replacement =
+                arena_copy_tokens(lexer->arena, macro->replacement);
+            return replacement;
+        }
+    }
+
+    return NULL;
+}
+
+macro_arg_t *lexer_find_macro_arg(lexer_t *lexer, regional_lexer_t *reg_lexer)
+{
+    if (!reg_lexer_peek_token(reg_lexer, T_identifier, NULL))
+        return NULL;
+
+    macro_arg_t *cur = reg_lexer->macro_args;
+
+    while (cur) {
+        if (!strcmp(cur->name->literal, reg_lexer->cur_token->literal))
+            return cur;
+
+        cur = cur->next;
+    }
+
+    return NULL;
+}
+
+token_t *lexer_expand_arg(lexer_t *lexer,
+                          regional_lexer_t *reg_lexer,
+                          macro_arg_t *arg)
+{
+    if (arg->expanded)
+        return arg->expanded;
+
+    if (!arg->replacement)
+        return NULL;
+    token_t *cur_replacement = arg->replacement;
+    token_t *expanded = NULL, *cur = NULL;
+
+    while (cur_replacement) {
+        token_t *expanded_macro =
+            lexer_expand_macro_indirect(lexer, reg_lexer, cur_replacement);
+
+        if (expanded_macro) {
+            /* gets expanded macro's replacement end then concatentate to
+             * cur_replacement's front
+             */
+            token_t *cur_expanded_macro = expanded_macro;
+
+            while (cur_expanded_macro->next)
+                cur_expanded_macro = cur_replacement->next;
+
+            cur_expanded_macro->next = cur_replacement;
+            cur_replacement = expanded_macro;
+            continue;
+        }
+
+        if (expanded) {
+            cur->next = arena_copy_token(lexer->arena, cur_replacement);
+            cur = cur->next;
+        } else {
+            expanded = arena_copy_token(lexer->arena, cur_replacement);
+            cur = expanded;
+        }
+
+        cur_replacement = cur_replacement->next;
+    }
+
+    arg->expanded = expanded;
+    return expanded;
+}
+
+bool lexer_substitute_token(lexer_t *lexer, regional_lexer_t *reg_lexer)
+{
+    macro_arg_t *arg = lexer_find_macro_arg(lexer, reg_lexer);
+
+    if (arg) {
+        token_t *replacement = lexer_expand_arg(lexer, reg_lexer, arg);
+        reg_lexer_expect_token(reg_lexer, T_identifier);
+        regional_lexer_t *arg_lexer = reg_lexer_token_init(
+            lexer->arena, replacement, NULL, reg_lexer->file_idx);
+        lexer_stack_push(lexer->regional_lexers, arg_lexer);
+        return true;
     }
 
     return false;
@@ -955,29 +1235,45 @@ token_type_t lexer_next_token(lexer_t *lexer)
     reg_lexer_next_token(reg_lexer);
     token_type_t typ = reg_lexer->cur_token->typ;
 
-    switch (typ) {
-    case T_eof: {
-        if (lexer->regional_lexers->len) {
-            lexer_stack_pop(lexer->regional_lexers);
-            return lexer_next_token(lexer);
+    if (reg_lexer->mode == LM_token) {
+        switch (typ) {
+        case T_eof: {
+            if (lexer->regional_lexers->len) {
+                lexer_stack_pop(lexer->regional_lexers);
+                regional_lexer_t *cur_reg_lexer = lexer_top_reg_lexer(lexer);
+                return cur_reg_lexer->cur_token->typ;
+            }
+            break;
         }
-        break;
-    }
-    case T_cppd_hash: {
-        if (reg_lexer->mode == LM_source && !reg_lexer->inside_macro) {
-            /* only suppose to be directive */
-            lexer_read_directive(lexer, reg_lexer);
-            return lexer_next_token(lexer);
+        default: {
+            if (lexer_substitute_token(lexer, reg_lexer))
+                return lexer_next_token(lexer);
         }
-        break;
-    }
-    case T_identifier: {
-        if (lexer_expand_macro(lexer, reg_lexer))
-            return lexer_next_token(lexer);
-        break;
-    }
-    default:
-        break;
+        }
+    } else {
+        switch (typ) {
+        case T_eof: {
+            if (lexer->regional_lexers->len) {
+                lexer_stack_pop(lexer->regional_lexers);
+                regional_lexer_t *cur_reg_lexer = lexer_top_reg_lexer(lexer);
+                return cur_reg_lexer->cur_token->typ;
+            }
+            break;
+        }
+        case T_cppd_hash: {
+            if (reg_lexer->mode == LM_source && !reg_lexer->inside_macro) {
+                /* only suppose to be directive */
+                lexer_read_directive(lexer, reg_lexer);
+                return lexer_next_token(lexer);
+            }
+        }
+        case T_identifier: {
+            if (lexer_expand_macro_direct(lexer, reg_lexer))
+                return lexer_next_token(lexer);
+        }
+        default:
+            break;
+        }
     }
 
     return typ;
