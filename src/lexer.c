@@ -36,6 +36,23 @@ token_t *alloc_token(token_arena_t *arena, int size)
     return data;
 }
 
+token_t *realloc_token(token_arena_t *arena, token_t *tail, int size)
+{
+    /* TODO: Expand arena if remaining capacity is not enough */
+    if (arena->size + size > arena->capacity)
+        return NULL;
+
+    token_t *data = &arena->data[arena->size], *cur = data;
+    for (int i = 1; i < size; i++) {
+        cur->next = &arena->data[arena->size + i];
+        cur = cur->next;
+    }
+    tail->next = data;
+    cur->next = NULL;
+    arena->size += size;
+    return cur;
+}
+
 /* Copies single token data to a new token */
 token_t *arena_copy_token(token_arena_t *arena, token_t *token)
 {
