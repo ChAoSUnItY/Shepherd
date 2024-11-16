@@ -42,9 +42,9 @@ token_t *realloc_token(token_arena_t *arena, token_t *tail, int size)
     if (arena->size + size > arena->capacity)
         return NULL;
 
-    token_t *data = &tail[1], *cur = data;
+    token_t *data = &arena->data[arena->size], *cur = data;
     for (int i = 1; i < size; i++) {
-        cur->next = &data[i];
+        cur->next = &arena->data[arena->size + i];
         cur = cur->next;
     }
     tail->next = data;
